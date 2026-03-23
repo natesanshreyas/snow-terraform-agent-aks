@@ -119,7 +119,7 @@ kubectl get pods -n snow-terraform-agent -w
 
 ---
 
-## Step 4 — Configure the app (both paths)
+## Step 4 — Configure the app 
 
 ### 4a — Non-sensitive config (configmap.yaml)
 
@@ -157,7 +157,7 @@ Edit `k8s/secret.yaml` and fill in:
 
 ---
 
-## Step 8 (both paths) — Set up the ServiceNow Business Rule
+## Step 8 — Set up the ServiceNow Business Rule
 
 In your ServiceNow instance:
 
