@@ -1,0 +1,34 @@
+{{- if and .Values.async.enabled .Values.keda.enabled }}
+# KEDA TriggerAuthentication — authenticates to Service Bus via Workload Identity.
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ include "snow-terraform-agent.fullname" . }}-keda-auth
+  labels:
+    {{- include "snow-terraform-agent.labels" . | nindent 4 }}
+spec:
+  podIdentity:
+    provider: azure-workload
+---
+# KEDA ScaledObject — scales the worker Deployment based on ASB queue depth.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "snow-terraform-agent.fullname" . }}-worker
+  labels:
+    {{- include "snow-terraform-agent.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: {{ include "snow-terraform-agent.fullname" . }}-worker
+  minReplicaCount: {{ .Values.keda.minReplicaCount }}
+  maxReplicaCount: {{ .Values.keda.maxReplicaCount }}
+  cooldownPeriod: 60
+  triggers:
+    - type: azure-servicebus
+      metadata:
+        queueName: provisioning-queue
+        namespace: {{ .Values.keda.asbNamespace | quote }}
+        messageCount: "1"
+      authenticationRef:
+        name: {{ include "snow-terraform-agent.fullname" . }}-keda-auth
+{{- end }}

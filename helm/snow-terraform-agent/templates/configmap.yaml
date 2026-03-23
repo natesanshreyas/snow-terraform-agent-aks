@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "snow-terraform-agent.fullname" . }}-config
+  labels:
+    {{- include "snow-terraform-agent.labels" . | nindent 4 }}
+data:
+  AZURE_OPENAI_ENDPOINT: {{ .Values.azureOpenAI.endpoint | quote }}
+  AZURE_OPENAI_DEPLOYMENT_NAME: {{ .Values.azureOpenAI.deploymentName | quote }}
+  AZURE_OPENAI_MODEL_NAME: {{ .Values.azureOpenAI.modelName | quote }}
+  AZURE_OPENAI_API_VERSION: {{ .Values.azureOpenAI.apiVersion | quote }}
+  AZURE_OPENAI_USE_AZURE_AD: {{ .Values.azureOpenAI.useAzureAD | quote }}
+  SERVICENOW_INSTANCE_URL: {{ .Values.serviceNow.instanceUrl | quote }}
+  SERVICENOW_USERNAME: {{ .Values.serviceNow.username | quote }}
+  SNOW_MCP_COMMAND: {{ .Values.mcp.snowCommand | quote }}
+  GITHUB_MCP_COMMAND: {{ .Values.mcp.githubCommand | quote }}
+  AZURE_MCP_SERVER_COMMAND: {{ .Values.mcp.azureCommand | quote }}
+  GITHUB_ORG: {{ .Values.github.org | quote }}
+  GITHUB_TERRAFORM_REPO: {{ .Values.github.terraformRepo | quote }}
+  AZURE_SUBSCRIPTION_ID: {{ .Values.azure.subscriptionId | quote }}
+  AZURE_CLIENT_ID: {{ .Values.azure.clientId | quote }}
+  AZURE_TENANT_ID: {{ .Values.azure.tenantId | quote }}
+  {{- if .Values.async.enabled }}
+  AZURE_SERVICE_BUS_HOSTNAME: {{ .Values.async.serviceBusHostname | quote }}
+  AZURE_STORAGE_ACCOUNT_NAME: {{ .Values.async.storageAccountName | quote }}
+  {{- end }}
+  {{- if .Values.appInsights.connectionString }}
+  APPLICATIONINSIGHTS_CONNECTION_STRING: {{ .Values.appInsights.connectionString | quote }}
+  {{- end }}

@@ -1,0 +1,35 @@
+{{- if .Values.async.enabled }}
+# Worker pod — pulls jobs from Service Bus and runs the full agent loop.
+# Scaled by KEDA when keda.enabled=true.
+# See docs/patterns/async-mode.md for setup instructions.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "snow-terraform-agent.fullname" . }}-worker
+  labels:
+    {{- include "snow-terraform-agent.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "snow-terraform-agent.selectorLabels" . | nindent 6 }}
+      role: worker
+  template:
+    metadata:
+      labels:
+        {{- include "snow-terraform-agent.selectorLabels" . | nindent 8 }}
+        role: worker
+    spec:
+      containers:
+        - name: worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "src.asb_consumer"]
+          envFrom:
+            - configMapRef:
+                name: {{ include "snow-terraform-agent.fullname" . }}-config
+            - secretRef:
+                name: {{ include "snow-terraform-agent.fullname" . }}-secrets
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+{{- end }}

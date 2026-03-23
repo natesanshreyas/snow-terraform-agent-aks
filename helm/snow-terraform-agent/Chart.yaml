@@ -1,0 +1,6 @@
+apiVersion: v2
+name: snow-terraform-agent
+description: ServiceNow → Terraform Provisioning Agent
+type: application
+version: 0.1.0
+appVersion: "latest"

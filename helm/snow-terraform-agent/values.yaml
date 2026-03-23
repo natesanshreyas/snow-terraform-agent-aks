@@ -1,0 +1,108 @@
+# ---------------------------------------------------------------------------
+# snow-terraform-agent Helm values
+#
+# Fill in every value marked REQUIRED before installing.
+# Optional sections are clearly marked — leave them blank to disable.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Image
+# REQUIRED: set repository to your ACR login server + image name
+# ---------------------------------------------------------------------------
+image:
+  repository: ""          # e.g. snowagentacr.azurecr.io/snow-terraform-agent
+  tag: "latest"
+  pullPolicy: Always
+
+# ---------------------------------------------------------------------------
+# Azure OpenAI — REQUIRED
+# ---------------------------------------------------------------------------
+azureOpenAI:
+  endpoint: ""            # e.g. https://my-openai.openai.azure.com
+  deploymentName: ""      # e.g. gpt-4o
+  modelName: ""           # same as deploymentName
+  apiVersion: "2024-10-21"
+  useAzureAD: "true"      # set to "false" and provide apiKey if not using managed identity
+  apiKey: ""              # leave blank when useAzureAD=true
+
+# ---------------------------------------------------------------------------
+# ServiceNow — REQUIRED
+# ---------------------------------------------------------------------------
+serviceNow:
+  instanceUrl: ""         # e.g. https://dev123456.service-now.com
+  username: ""
+  password: ""            # stored in Kubernetes Secret
+
+# ---------------------------------------------------------------------------
+# GitHub — REQUIRED
+# ---------------------------------------------------------------------------
+github:
+  org: ""                 # GitHub org or username
+  terraformRepo: ""       # Terraform modules repo name
+  personalAccessToken: "" # stored in Kubernetes Secret (repo + workflow scopes)
+
+# ---------------------------------------------------------------------------
+# Azure identity — REQUIRED
+# ---------------------------------------------------------------------------
+azure:
+  subscriptionId: ""
+  clientId: ""            # App Registration Application (client) ID
+  tenantId: ""
+  clientSecret: ""        # stored in Kubernetes Secret
+
+# ---------------------------------------------------------------------------
+# MCP server commands — change only to pin a specific version
+# ---------------------------------------------------------------------------
+mcp:
+  snowCommand: "npx -y servicenow-mcp-server@latest"
+  githubCommand: "npx -y @modelcontextprotocol/server-github"
+  azureCommand: "npx -y @azure/mcp@latest server start"
+
+# ---------------------------------------------------------------------------
+# Ingress
+# Replace host with your AKS ingress hostname or APIM gateway URL.
+# Set enabled=false if you are managing ingress outside this chart.
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: nginx
+  host: ""                # e.g. snow-agent.eastus2.cloudapp.azure.com
+
+# ---------------------------------------------------------------------------
+# Async mode — OPTIONAL
+# Enable when you have Service Bus + Blob Storage.
+# See docs/patterns/async-mode.md for setup instructions.
+# ---------------------------------------------------------------------------
+async:
+  enabled: false
+  serviceBusHostname: ""  # e.g. my-asb.servicebus.windows.net
+  storageAccountName: ""  # e.g. mystorageaccount
+
+# ---------------------------------------------------------------------------
+# KEDA autoscaling — OPTIONAL
+# Requires async.enabled=true and KEDA installed on the cluster.
+# See docs/patterns/async-mode.md for setup instructions.
+# ---------------------------------------------------------------------------
+keda:
+  enabled: false
+  asbNamespace: ""        # Service Bus namespace name (not the full hostname)
+  minReplicaCount: 0
+  maxReplicaCount: 5
+
+# ---------------------------------------------------------------------------
+# Application Insights — OPTIONAL
+# See docs/patterns/app-insights.md for setup instructions.
+# ---------------------------------------------------------------------------
+appInsights:
+  connectionString: ""
+
+# ---------------------------------------------------------------------------
+# Pod resources — adjust based on your cluster quota
+# ---------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: "250m"
+    memory: "512Mi"
+  limits:
+    cpu: "1000m"
+    memory: "2Gi"

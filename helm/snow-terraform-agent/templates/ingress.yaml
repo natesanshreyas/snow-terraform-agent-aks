@@ -1,0 +1,23 @@
+{{- if .Values.ingress.enabled }}
+# See docs/patterns/apim.md if you are using APIM or a private endpoint instead.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "snow-terraform-agent.fullname" . }}
+  labels:
+    {{- include "snow-terraform-agent.labels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/ingress.class: {{ .Values.ingress.className | quote }}
+spec:
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "snow-terraform-agent.fullname" . }}
+                port:
+                  number: 80
+{{- end }}

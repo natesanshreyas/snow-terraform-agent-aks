@@ -62,9 +62,83 @@ Each feature has a standalone guide in `docs/patterns/`. Enable only what applie
 - Azure CLI (`az`) — logged in (`az login`)
 - Terraform >= 1.5
 - kubectl
+- Helm >= 3.0
 - Docker (or use `az acr build`)
 
 ---
+
+## Deploy with Helm (recommended)
+
+The Helm chart in `helm/snow-terraform-agent/` packages all k8s manifests into a single install. Fill in `values.yaml` once and run one command.
+
+### Step 1 — Fill in values.yaml
+
+```bash
+cp helm/snow-terraform-agent/values.yaml my-values.yaml
+# edit my-values.yaml — fill in all REQUIRED fields
+```
+
+The file is fully commented. Required fields are clearly marked. Optional features (async mode, KEDA, APIM, App Insights) are disabled by default — enable them by setting the relevant flag and providing the config values.
+
+### Step 2 — Build and push the image
+
+```bash
+az acr build --registry <your-acr> --image snow-terraform-agent:latest .
+```
+
+Set `image.repository` in `my-values.yaml` to `<your-acr>.azurecr.io/snow-terraform-agent`.
+
+### Step 3 — Install
+
+```bash
+helm install snow-agent ./helm/snow-terraform-agent \
+  --namespace snow-terraform-agent \
+  --create-namespace \
+  --values my-values.yaml
+```
+
+### Upgrade after config or image change
+
+```bash
+helm upgrade snow-agent ./helm/snow-terraform-agent \
+  --namespace snow-terraform-agent \
+  --values my-values.yaml
+```
+
+### Enable optional features
+
+Set flags in `my-values.yaml` and upgrade:
+
+```yaml
+# Async mode
+async:
+  enabled: true
+  serviceBusHostname: "my-asb.servicebus.windows.net"
+  storageAccountName: "mystorageaccount"
+
+# KEDA autoscaling (requires async.enabled=true + KEDA on cluster)
+keda:
+  enabled: true
+  asbNamespace: "my-asb"
+
+# App Insights
+appInsights:
+  connectionString: "InstrumentationKey=..."
+```
+
+See `docs/patterns/` for full setup instructions for each feature.
+
+### Uninstall
+
+```bash
+helm uninstall snow-agent --namespace snow-terraform-agent
+```
+
+---
+
+## Deploy with kubectl (alternative)
+
+If you prefer raw manifests over Helm, use the files in `k8s/` directly.
 
 ## Path A — POC / Standalone (no existing cluster)
 
