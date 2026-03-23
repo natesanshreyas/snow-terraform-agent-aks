@@ -9,11 +9,23 @@ SNOW Business Rule (on ticket approval)
   → POST /api/provision  {"ticket_id": "RITM0001234"}
 
 Agent (running in AKS)
-  → SNOW MCP:   read ticket details
+  → SNOW MCP:    read ticket details
   → Azure OpenAI: generate Terraform HCL
-  → GitHub MCP: create branch → push files → open PR
-  → SNOW MCP:   post PR link as work note
+  → GitHub MCP:  create branch → push files → open PR
+  → SNOW MCP:    post PR link as work note
 ```
+
+---
+
+## Choose your infrastructure path
+
+| | `infra/aks-standalone/` | `infra/aks-existing/` |
+|---|---|---|
+| **Use when** | You need a cluster provisioned from scratch (demo / greenfield) | Your org already runs AKS |
+| **Creates** | RG, AKS, ACR, nginx ingress, DNS label | Namespace only (+ optional ASB / Blob / App Insights) |
+| **Does not touch** | — | Your cluster, VNet, ACR, LB, DNS |
+
+---
 
 ## What you need before starting
 
@@ -39,51 +51,137 @@ Agent (running in AKS)
 
 ---
 
-## Step 1 — Provision infrastructure
+## Path A — Standalone (no existing cluster)
+
+### Step 1 — Provision infrastructure
 
 ```bash
-cd infra/aks
+cd infra/aks-standalone
 terraform init
 terraform apply
 ```
 
-Takes ~10 minutes. At the end note these outputs:
+Takes ~10 minutes. Note these outputs:
 
 ```
-hostname         = "snow-agent.eastus2.cloudapp.azure.com"
-acr_login_server = "snowagentacr.azurecr.io"
+hostname            = "snow-agent.eastus2.cloudapp.azure.com"
+acr_login_server    = "snowagentacr.azurecr.io"
 aks_connect_command = "az aks get-credentials ..."
 ```
 
-To change the cluster name, ACR name, region, or DNS label edit the defaults in `infra/aks/variables.tf` before running apply.
+To change the cluster name, ACR name, region, or DNS label edit the defaults in `infra/aks-standalone/variables.tf` before running apply.
 
----
-
-## Step 2 — Point kubectl at your cluster
+### Step 2 — Point kubectl at your cluster
 
 ```bash
 az aks get-credentials --resource-group snow-terraform-agent-rg --name snow-agent-aks
 ```
 
----
+### Step 3 — Build and push the container image
 
-## Step 3 — Build and push the container image
-
-**Option A — Without local Docker (recommended):**
+**Without local Docker (recommended):**
 ```bash
 az acr build --registry snowagentacr --image snow-terraform-agent:latest .
 ```
 
-**Option B — With local Docker:**
+**With local Docker:**
 ```bash
 az acr login --name snowagentacr
 docker build -t snowagentacr.azurecr.io/snow-terraform-agent:latest .
 docker push snowagentacr.azurecr.io/snow-terraform-agent:latest
 ```
 
+### Step 4 — Configure the app
+
+See [Step 4 — Configure the app](#step-4--configure-the-app-both-paths) below.
+
+### Step 5 — Stamp the ACR and hostname into the manifests
+
+```bash
+sed -i 's|<ACR_LOGIN_SERVER>|snowagentacr.azurecr.io|g' k8s/deployment.yaml
+sed -i 's|<DNS_LABEL>.eastus2.cloudapp.azure.com|snow-agent.eastus2.cloudapp.azure.com|g' k8s/ingress.yaml
+```
+
+If you changed the ACR name or DNS label in `variables.tf`, substitute your values above.
+
+### Step 6 — Deploy
+
+```bash
+kubectl apply -f k8s/
+kubectl get pods -w
+```
+
 ---
 
-## Step 4 — Configure the app
+## Path B — Existing cluster
+
+### Step 1 — Point kubectl at your cluster
+
+```bash
+az aks get-credentials --resource-group <your-rg> --name <your-cluster>
+kubectl config get-contexts   # note the context name
+```
+
+### Step 2 — Provision application-layer resources
+
+```bash
+cd infra/aks-existing
+terraform init
+
+# Sync-only (simplest):
+terraform apply \
+  -var="subscription_id=<your-sub-id>" \
+  -var="resource_group_name=<your-rg>" \
+  -var="kube_context=<your-context>"
+
+# With async mode + observability:
+terraform apply \
+  -var="subscription_id=<your-sub-id>" \
+  -var="resource_group_name=<your-rg>" \
+  -var="kube_context=<your-context>" \
+  -var="create_service_bus=true" \
+  -var="service_bus_name=snow-agent-asb" \
+  -var="create_blob_storage=true" \
+  -var="storage_account_name=snowagentstate" \
+  -var="create_app_insights=true"
+```
+
+Copy any output values (Service Bus hostname, App Insights connection string) into `k8s/configmap.yaml`.
+
+### Step 3 — Build and push to your ACR
+
+```bash
+az acr build --registry <your-acr-name> --image snow-terraform-agent:latest .
+```
+
+### Step 4 — Configure the app
+
+See [Step 4 — Configure the app](#step-4--configure-the-app-both-paths) below.
+
+### Step 5 — Update the image in deployment.yaml
+
+```bash
+sed -i 's|<ACR_LOGIN_SERVER>|<your-acr>.azurecr.io|g' k8s/deployment.yaml
+```
+
+### Step 6 — Configure ingress
+
+`k8s/ingress.yaml` is written for a standalone nginx + public LB. If your org has a different setup, read the comments at the top of that file before applying. Common alternatives:
+
+- **Internal nginx** — change the controller service to use an internal load balancer IP
+- **APIM in front** — delete `ingress.yaml`, configure APIM to route to `snow-terraform-agent.<namespace>.svc.cluster.local`
+- **Private endpoint / no public IP** — delete `ingress.yaml`, use your org's existing internal gateway
+
+### Step 7 — Deploy
+
+```bash
+kubectl apply -f k8s/ -n snow-terraform-agent
+kubectl get pods -n snow-terraform-agent -w
+```
+
+---
+
+## Step 4 — Configure the app (both paths)
 
 ### 4a — Non-sensitive config (configmap.yaml)
 
@@ -121,36 +219,7 @@ Edit `k8s/secret.yaml` and fill in:
 
 ---
 
-## Step 5 — Stamp the ACR and hostname into the manifests
-
-```bash
-# Replace the image placeholder with your ACR address
-sed -i 's|<ACR_LOGIN_SERVER>|snowagentacr.azurecr.io|g' k8s/deployment.yaml
-
-# Replace the hostname placeholder with your ingress hostname
-sed -i 's|<DNS_LABEL>.eastus2.cloudapp.azure.com|snow-agent.eastus2.cloudapp.azure.com|g' k8s/ingress.yaml
-```
-
-If you changed the ACR name or DNS label in `variables.tf`, substitute your values above.
-
----
-
-## Step 6 — Deploy to Kubernetes
-
-```bash
-kubectl apply -f k8s/
-```
-
-Verify the pod is running:
-```bash
-kubectl get pods -w
-```
-
-Wait until status shows `Running`.
-
----
-
-## Step 7 — Set up the ServiceNow Business Rule
+## Step 8 (both paths) — Set up the ServiceNow Business Rule
 
 In your ServiceNow instance:
 
@@ -159,7 +228,7 @@ In your ServiceNow instance:
 1. Navigate to **System Web Services → Outbound → REST Messages → New**
 2. Fill in:
    - **Name**: `ProvisioningAgent`
-   - **Endpoint**: `http://snow-agent.eastus2.cloudapp.azure.com/api/provision`
+   - **Endpoint**: `http://<your-hostname>/api/provision`
    - **HTTP Method**: POST
 3. Add header: `Content-Type: application/json`
 4. Set body: `{"ticket_id": "${ticket_id}"}`
@@ -184,7 +253,7 @@ rm.execute();
 ## Updating the app
 
 ```bash
-az acr build --registry snowagentacr --image snow-terraform-agent:latest .
+az acr build --registry <your-acr> --image snow-terraform-agent:latest .
 kubectl rollout restart deployment/snow-terraform-agent
 ```
 
@@ -192,9 +261,16 @@ kubectl rollout restart deployment/snow-terraform-agent
 
 ## Teardown
 
+**Standalone:**
 ```bash
 kubectl delete -f k8s/
-cd infra/aks && terraform destroy
+cd infra/aks-standalone && terraform destroy
+```
+
+**Existing cluster:**
+```bash
+kubectl delete -f k8s/ -n snow-terraform-agent
+cd infra/aks-existing && terraform destroy
 ```
 
 ---
@@ -203,7 +279,7 @@ cd infra/aks && terraform destroy
 
 ### POC (this repo)
 ```
-SNOW → AKS (nginx ingress → pod) → OpenAI + SNOW MCP + GitHub MCP
+SNOW → AKS (ingress → pod) → OpenAI + SNOW MCP + GitHub MCP
 ```
 
 ### Production additions recommended
