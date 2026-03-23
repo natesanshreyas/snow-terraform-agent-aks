@@ -21,12 +21,24 @@ Agent (running in AKS)
 
 ## Deployment modes
 
+The core agent works out of the box with just AKS + Azure OpenAI. Production features are opt-in — enable only what your environment needs.
+
 | | POC | Production |
 |---|---|---|
 | **Execution** | Synchronous — agent runs inline, SNOW waits | Async — SNOW gets 202 immediately, worker processes from queue |
-| **Infra** | `infra/aks-standalone/` or `infra/aks-existing/` (flags off) | `infra/aks-existing/` (all flags on) |
+| **Infra** | `infra/aks-standalone/` or `infra/aks-existing/` | `infra/aks-existing/` with feature flags |
 | **Pods** | 1 API pod | 1 API pod + 1–5 worker pods (KEDA-scaled) |
-| **Extra services** | None | Service Bus, Blob Storage, App Insights, APIM, Key Vault |
+
+### Optional production features
+
+Each feature has a standalone guide in `docs/patterns/`. Enable only what applies to your environment. If you already have the underlying Azure resource, skip the Terraform and go straight to the wiring steps.
+
+| Feature | Guide | What it adds |
+|---------|-------|-------------|
+| Async mode | [`docs/patterns/async-mode.md`](docs/patterns/async-mode.md) | Service Bus queue + worker pod + KEDA autoscaling |
+| APIM | [`docs/patterns/apim.md`](docs/patterns/apim.md) | Rate limiting + IP allowlisting for the SNOW webhook |
+| Key Vault | [`docs/patterns/key-vault.md`](docs/patterns/key-vault.md) | Replaces `secret.yaml` — pod reads credentials from KV at startup |
+| App Insights | [`docs/patterns/app-insights.md`](docs/patterns/app-insights.md) | Distributed tracing + evaluator score logging to Foundry |
 
 ---
 
@@ -153,128 +165,6 @@ kubectl apply -f k8s/deployment.yaml -f k8s/service.yaml -f k8s/ingress.yaml \
               -f k8s/configmap.yaml -f k8s/secret.yaml \
               -n snow-terraform-agent
 kubectl get pods -n snow-terraform-agent -w
-```
-
----
-
-## Path C — Production (existing cluster, full async stack)
-
-### Step 1 — Install KEDA on the cluster
-
-```bash
-helm repo add kedacore https://charts.kedacore.io
-helm repo update
-helm install keda kedacore/keda --namespace keda --create-namespace
-```
-
-### Step 2 — Provision all production resources
-
-```bash
-cd infra/aks-existing
-terraform init
-terraform apply \
-  -var="subscription_id=<your-sub-id>" \
-  -var="resource_group_name=<your-rg>" \
-  -var="kube_context=<your-context>" \
-  -var="create_service_bus=true" \
-  -var="service_bus_name=snow-agent-asb" \
-  -var="create_blob_storage=true" \
-  -var="storage_account_name=snowagentstate" \
-  -var="create_app_insights=true" \
-  -var="create_apim=true" \
-  -var="apim_name=snow-agent-apim" \
-  -var="apim_publisher_name=<your-org>" \
-  -var="apim_publisher_email=<your-email>" \
-  -var="aks_ingress_url=http://<your-aks-hostname>" \
-  -var="create_key_vault=true" \
-  -var="key_vault_name=snow-agent-kv" \
-  -var="tenant_id=<your-tenant-id>" \
-  -var="pod_identity_object_id=<your-managed-identity-object-id>"
-```
-
-Note the outputs:
-
-```
-service_bus_hostname            = "snow-agent-asb.servicebus.windows.net"
-storage_account_name            = "snowagentstate"
-app_insights_connection_string  = (sensitive — run: terraform output app_insights_connection_string)
-apim_gateway_url                = "https://snow-agent-apim.azure-api.net"
-key_vault_uri                   = "https://snow-agent-kv.vault.azure.net/"
-```
-
-### Step 3 — Build and push image
-
-```bash
-az acr build --registry <your-acr-name> --image snow-terraform-agent:latest .
-```
-
-### Step 4 — Fill in configmap.yaml
-
-Copy the Terraform outputs into `k8s/configmap.yaml`:
-
-```yaml
-AZURE_SERVICE_BUS_HOSTNAME: "snow-agent-asb.servicebus.windows.net"
-AZURE_STORAGE_ACCOUNT_NAME: "snowagentstate"
-APPLICATIONINSIGHTS_CONNECTION_STRING: "<from terraform output>"
-```
-
-### Step 5 — Create secret.yaml
-
-```bash
-cp k8s/secret.yaml.example k8s/secret.yaml
-# edit k8s/secret.yaml
-```
-
-> In full production with Key Vault + Workload Identity, `secret.yaml` is replaced by CSI driver secret injection. See Key Vault notes in `infra/aks-existing/main.tf`.
-
-### Step 6 — Stamp ACR into manifests
-
-```bash
-sed -i 's|<ACR_LOGIN_SERVER>|<your-acr>.azurecr.io|g' k8s/deployment.yaml k8s/worker-deployment.yaml
-```
-
-### Step 7 — Deploy all manifests
-
-```bash
-# Core
-kubectl apply -f k8s/configmap.yaml -f k8s/secret.yaml \
-              -f k8s/deployment.yaml -f k8s/service.yaml -f k8s/ingress.yaml \
-              -n snow-terraform-agent
-
-# Worker + KEDA (edit keda-scaledobject.yaml first — replace <ASB_NAMESPACE> with your ASB namespace name)
-kubectl apply -f k8s/worker-deployment.yaml \
-              -f k8s/keda-auth.yaml \
-              -f k8s/keda-scaledobject.yaml \
-              -n snow-terraform-agent
-
-kubectl get pods -n snow-terraform-agent -w
-```
-
-### Step 8 — Set up ServiceNow Business Rule
-
-Use the APIM gateway URL (not the AKS ingress URL directly):
-
-**Create the REST Message:**
-1. Navigate to **System Web Services → Outbound → REST Messages → New**
-2. Fill in:
-   - **Name**: `ProvisioningAgent`
-   - **Endpoint**: `https://snow-agent-apim.azure-api.net/api/provision`
-   - **HTTP Method**: POST
-3. Add header: `Content-Type: application/json`
-4. Set body: `{"ticket_id": "${ticket_id}"}`
-
-**Create the Business Rule:**
-1. Navigate to **System Definition → Business Rules → New**
-2. Fill in:
-   - **Table**: `sc_req_item`
-   - **When**: After Update
-   - **Condition**: `current.approval == 'approved' && previous.approval != 'approved'`
-3. Enable **Advanced** and paste this script:
-
-```javascript
-var rm = new sn_ws.RESTMessageV2('ProvisioningAgent', 'trigger');
-rm.setStringParameterNoEscape('ticket_id', current.number);
-rm.execute();
 ```
 
 ---
