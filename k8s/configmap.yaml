@@ -5,19 +5,50 @@ metadata:
   labels:
     app: snow-terraform-agent
 data:
+  # ---------------------------------------------------------------------------
+  # Azure OpenAI
+  # ---------------------------------------------------------------------------
   AZURE_OPENAI_ENDPOINT: ""
   AZURE_OPENAI_DEPLOYMENT_NAME: ""
   AZURE_OPENAI_API_VERSION: "2024-10-21"
   AZURE_OPENAI_MODEL_NAME: ""
   AZURE_OPENAI_USE_AZURE_AD: "true"
+
+  # ---------------------------------------------------------------------------
+  # ServiceNow
+  # ---------------------------------------------------------------------------
   SERVICENOW_INSTANCE_URL: ""
   SERVICENOW_USERNAME: ""
+
+  # ---------------------------------------------------------------------------
+  # MCP server commands (do not change unless pinning a specific version)
+  # ---------------------------------------------------------------------------
   SNOW_MCP_COMMAND: "npx -y servicenow-mcp-server@latest"
   GITHUB_MCP_COMMAND: "npx -y @modelcontextprotocol/server-github"
+  AZURE_MCP_SERVER_COMMAND: "npx -y @azure/mcp@latest server start"
+
+  # ---------------------------------------------------------------------------
+  # GitHub
+  # ---------------------------------------------------------------------------
   GITHUB_ORG: ""
   GITHUB_TERRAFORM_REPO: ""
+
+  # ---------------------------------------------------------------------------
+  # Azure identity
+  # ---------------------------------------------------------------------------
   AZURE_SUBSCRIPTION_ID: ""
   AZURE_CLIENT_ID: ""
   AZURE_TENANT_ID: ""
-  AZURE_MCP_SERVER_COMMAND: "npx -y @azure/mcp@latest server start"
+
+  # ---------------------------------------------------------------------------
+  # Production: async mode (set both when create_service_bus = true)
+  # Values from Terraform outputs: service_bus_hostname, storage_account_name
+  # ---------------------------------------------------------------------------
+  AZURE_SERVICE_BUS_HOSTNAME: ""
+  AZURE_STORAGE_ACCOUNT_NAME: ""
+
+  # ---------------------------------------------------------------------------
+  # Production: observability
+  # Value from Terraform output: app_insights_connection_string
+  # ---------------------------------------------------------------------------
   APPLICATIONINSIGHTS_CONNECTION_STRING: ""

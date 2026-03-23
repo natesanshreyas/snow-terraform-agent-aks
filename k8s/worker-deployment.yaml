@@ -1,0 +1,45 @@
+# ---------------------------------------------------------------------------
+# Worker Deployment — async provisioning mode (production)
+#
+# This is the second pod. It pulls jobs from Azure Service Bus and runs the
+# full agent loop. Scaled by KEDA based on ASB queue depth (see keda-scaledobject.yaml).
+#
+# Prerequisites:
+#   - create_service_bus = true in infra/aks-existing/
+#   - KEDA installed on the cluster (see README — Production Path, Step 1)
+#   - AZURE_SERVICE_BUS_HOSTNAME set in k8s/configmap.yaml
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: snow-terraform-agent-worker
+  labels:
+    app: snow-terraform-agent-worker
+spec:
+  replicas: 1   # KEDA overrides this — do not scale manually
+  selector:
+    matchLabels:
+      app: snow-terraform-agent-worker
+  template:
+    metadata:
+      labels:
+        app: snow-terraform-agent-worker
+    spec:
+      containers:
+        - name: worker
+          # Same image as the API pod — different entrypoint
+          image: <ACR_LOGIN_SERVER>/snow-terraform-agent:latest
+          imagePullPolicy: Always
+          command: ["python", "-m", "src.asb_consumer"]
+          envFrom:
+            - configMapRef:
+                name: snow-terraform-agent-config
+            - secretRef:
+                name: snow-terraform-agent-secrets
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"

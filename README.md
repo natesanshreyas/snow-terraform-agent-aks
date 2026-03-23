@@ -9,25 +9,28 @@ SNOW Business Rule (on ticket approval)
   → POST /api/provision  {"ticket_id": "RITM0001234"}
 
 Agent (running in AKS)
-  → SNOW MCP:    read ticket details
+  → SNOW MCP:     read ticket details + validate approval + cost center
+  → Azure MCP:    scan existing Azure inventory (Agent 1)
   → Azure OpenAI: generate Terraform HCL
-  → GitHub MCP:  create branch → push files → open PR
-  → SNOW MCP:    post PR link as work note
+  → Evaluators:   score HCL on security / compliance / quality (retry if fail)
+  → GitHub MCP:   create branch → push files → open PR
+  → SNOW MCP:     post PR link as work note
 ```
 
 ---
 
-## Choose your infrastructure path
+## Deployment modes
 
-| | `infra/aks-standalone/` | `infra/aks-existing/` |
+| | POC | Production |
 |---|---|---|
-| **Use when** | You need a cluster provisioned from scratch (demo / greenfield) | Your org already runs AKS |
-| **Creates** | RG, AKS, ACR, nginx ingress, DNS label | Namespace only (+ optional ASB / Blob / App Insights) |
-| **Does not touch** | — | Your cluster, VNet, ACR, LB, DNS |
+| **Execution** | Synchronous — agent runs inline, SNOW waits | Async — SNOW gets 202 immediately, worker processes from queue |
+| **Infra** | `infra/aks-standalone/` or `infra/aks-existing/` (flags off) | `infra/aks-existing/` (all flags on) |
+| **Pods** | 1 API pod | 1 API pod + 1–5 worker pods (KEDA-scaled) |
+| **Extra services** | None | Service Bus, Blob Storage, App Insights, APIM, Key Vault |
 
 ---
 
-## What you need before starting
+## Prerequisites
 
 ### Azure
 - An Azure subscription
@@ -40,18 +43,76 @@ Agent (running in AKS)
 
 ### GitHub
 - A GitHub org or account
-- A Terraform modules repo (can be empty to start)
+- A Terraform modules repo with examples (see [Terraform modules repo](#terraform-modules-repo))
 - A **Personal Access Token** with `repo` + `workflow` scopes
 
 ### Local tools
 - Azure CLI (`az`) — logged in (`az login`)
 - Terraform >= 1.5
 - kubectl
-- Docker (or use `az acr build` to build without Docker)
+- Docker (or use `az acr build`)
 
 ---
 
-## Implementation Path — Existing cluster
+## Path A — POC / Standalone (no existing cluster)
+
+### Step 1 — Provision infrastructure
+
+```bash
+cd infra/aks-standalone
+terraform init
+terraform apply
+```
+
+Takes ~10 minutes. Note these outputs:
+
+```
+hostname            = "snow-agent.eastus2.cloudapp.azure.com"
+acr_login_server    = "snowagentacr.azurecr.io"
+aks_connect_command = "az aks get-credentials ..."
+```
+
+### Step 2 — Point kubectl at your cluster
+
+```bash
+az aks get-credentials --resource-group snow-terraform-agent-rg --name snow-agent-aks
+```
+
+### Step 3 — Build and push the container image
+
+```bash
+az acr build --registry snowagentacr --image snow-terraform-agent:latest .
+```
+
+### Step 4 — Configure the app
+
+Fill in `k8s/configmap.yaml` (see [Config reference](#config-reference)) and create `k8s/secret.yaml`:
+
+```bash
+cp k8s/secret.yaml.example k8s/secret.yaml
+# edit k8s/secret.yaml
+```
+
+### Step 5 — Stamp the ACR and hostname into the manifests
+
+```bash
+sed -i 's|<ACR_LOGIN_SERVER>|snowagentacr.azurecr.io|g' k8s/deployment.yaml k8s/worker-deployment.yaml
+sed -i 's|<DNS_LABEL>.eastus2.cloudapp.azure.com|snow-agent.eastus2.cloudapp.azure.com|g' k8s/ingress.yaml
+```
+
+### Step 6 — Deploy
+
+```bash
+kubectl apply -f k8s/deployment.yaml -f k8s/service.yaml -f k8s/ingress.yaml \
+              -f k8s/configmap.yaml -f k8s/secret.yaml
+kubectl get pods -w
+```
+
+> Do not apply `worker-deployment.yaml`, `keda-scaledobject.yaml`, or `keda-auth.yaml` for the POC — those are production-only.
+
+---
+
+## Path B — POC / Existing cluster
 
 ### Step 1 — Point kubectl at your cluster
 
@@ -60,19 +121,57 @@ az aks get-credentials --resource-group <your-rg> --name <your-cluster>
 kubectl config get-contexts   # note the context name
 ```
 
-### Step 2 — Provision application-layer resources
+### Step 2 — Provision namespace
 
 ```bash
 cd infra/aks-existing
 terraform init
-
-# Sync-only (simplest):
 terraform apply \
   -var="subscription_id=<your-sub-id>" \
   -var="resource_group_name=<your-rg>" \
   -var="kube_context=<your-context>"
+```
 
-# With async mode + observability:
+### Step 3 — Build and push to your ACR
+
+```bash
+az acr build --registry <your-acr-name> --image snow-terraform-agent:latest .
+```
+
+### Step 4 — Configure and deploy
+
+Fill in `k8s/configmap.yaml`, create `k8s/secret.yaml`, stamp the ACR name:
+
+```bash
+sed -i 's|<ACR_LOGIN_SERVER>|<your-acr>.azurecr.io|g' k8s/deployment.yaml k8s/worker-deployment.yaml
+```
+
+Review `k8s/ingress.yaml` — see comments at the top for internal nginx, APIM, and private endpoint patterns.
+
+```bash
+kubectl apply -f k8s/deployment.yaml -f k8s/service.yaml -f k8s/ingress.yaml \
+              -f k8s/configmap.yaml -f k8s/secret.yaml \
+              -n snow-terraform-agent
+kubectl get pods -n snow-terraform-agent -w
+```
+
+---
+
+## Path C — Production (existing cluster, full async stack)
+
+### Step 1 — Install KEDA on the cluster
+
+```bash
+helm repo add kedacore https://charts.kedacore.io
+helm repo update
+helm install keda kedacore/keda --namespace keda --create-namespace
+```
+
+### Step 2 — Provision all production resources
+
+```bash
+cd infra/aks-existing
+terraform init
 terraform apply \
   -var="subscription_id=<your-sub-id>" \
   -var="resource_group_name=<your-rg>" \
@@ -81,98 +180,90 @@ terraform apply \
   -var="service_bus_name=snow-agent-asb" \
   -var="create_blob_storage=true" \
   -var="storage_account_name=snowagentstate" \
-  -var="create_app_insights=true"
+  -var="create_app_insights=true" \
+  -var="create_apim=true" \
+  -var="apim_name=snow-agent-apim" \
+  -var="apim_publisher_name=<your-org>" \
+  -var="apim_publisher_email=<your-email>" \
+  -var="aks_ingress_url=http://<your-aks-hostname>" \
+  -var="create_key_vault=true" \
+  -var="key_vault_name=snow-agent-kv" \
+  -var="tenant_id=<your-tenant-id>" \
+  -var="pod_identity_object_id=<your-managed-identity-object-id>"
 ```
 
-Copy any output values (Service Bus hostname, App Insights connection string) into `k8s/configmap.yaml`.
+Note the outputs:
 
-### Step 3 — Build and push to your ACR
+```
+service_bus_hostname            = "snow-agent-asb.servicebus.windows.net"
+storage_account_name            = "snowagentstate"
+app_insights_connection_string  = (sensitive — run: terraform output app_insights_connection_string)
+apim_gateway_url                = "https://snow-agent-apim.azure-api.net"
+key_vault_uri                   = "https://snow-agent-kv.vault.azure.net/"
+```
+
+### Step 3 — Build and push image
 
 ```bash
 az acr build --registry <your-acr-name> --image snow-terraform-agent:latest .
 ```
 
-### Step 4 — Configure the app
+### Step 4 — Fill in configmap.yaml
 
-See [Step 4 — Configure the app](#step-4--configure-the-app-both-paths) below.
+Copy the Terraform outputs into `k8s/configmap.yaml`:
 
-### Step 5 — Update the image in deployment.yaml
-
-```bash
-sed -i 's|<ACR_LOGIN_SERVER>|<your-acr>.azurecr.io|g' k8s/deployment.yaml
+```yaml
+AZURE_SERVICE_BUS_HOSTNAME: "snow-agent-asb.servicebus.windows.net"
+AZURE_STORAGE_ACCOUNT_NAME: "snowagentstate"
+APPLICATIONINSIGHTS_CONNECTION_STRING: "<from terraform output>"
 ```
 
-### Step 6 — Configure ingress
-
-`k8s/ingress.yaml` is written for a standalone nginx + public LB. If your org has a different setup, read the comments at the top of that file before applying. Common alternatives:
-
-- **Internal nginx** — change the controller service to use an internal load balancer IP
-- **APIM in front** — delete `ingress.yaml`, configure APIM to route to `snow-terraform-agent.<namespace>.svc.cluster.local`
-- **Private endpoint / no public IP** — delete `ingress.yaml`, use your org's existing internal gateway
-
-### Step 7 — Deploy
-
-```bash
-kubectl apply -f k8s/ -n snow-terraform-agent
-kubectl get pods -n snow-terraform-agent -w
-```
-
----
-
-## Step 4 — Configure the app 
-
-### 4a — Non-sensitive config (configmap.yaml)
-
-Edit `k8s/configmap.yaml` and replace every value with your own:
-
-| Key | Where to find it |
-|-----|-----------------|
-| `AZURE_OPENAI_ENDPOINT` | Azure Portal → your OpenAI resource → Keys and Endpoint |
-| `AZURE_OPENAI_DEPLOYMENT_NAME` | Azure Portal → your OpenAI resource → Model deployments |
-| `AZURE_OPENAI_MODEL_NAME` | Same as deployment name |
-| `SERVICENOW_INSTANCE_URL` | Your SNOW instance URL e.g. `https://dev123456.service-now.com` |
-| `SERVICENOW_USERNAME` | Your SNOW admin username |
-| `GITHUB_ORG` | Your GitHub org or username |
-| `GITHUB_TERRAFORM_REPO` | Name of your Terraform modules repo |
-| `AZURE_SUBSCRIPTION_ID` | `az account show --query id -o tsv` |
-| `AZURE_CLIENT_ID` | Azure Portal → App Registrations → your app → Application (client) ID |
-| `AZURE_TENANT_ID` | Azure Portal → App Registrations → your app → Directory (tenant) ID |
-
-### 4b — Sensitive credentials (secret.yaml)
+### Step 5 — Create secret.yaml
 
 ```bash
 cp k8s/secret.yaml.example k8s/secret.yaml
+# edit k8s/secret.yaml
 ```
 
-Edit `k8s/secret.yaml` and fill in:
+> In full production with Key Vault + Workload Identity, `secret.yaml` is replaced by CSI driver secret injection. See Key Vault notes in `infra/aks-existing/main.tf`.
 
-| Key | Where to find it |
-|-----|-----------------|
-| `AZURE_CLIENT_SECRET` | Azure Portal → App Registrations → your app → Certificates & Secrets |
-| `SERVICENOW_PASSWORD` | Your SNOW admin password |
-| `GITHUB_PERSONAL_ACCESS_TOKEN` | GitHub → Settings → Developer Settings → Personal Access Tokens (`repo` + `workflow` scopes) |
-| `AZURE_OPENAI_API_KEY` | Leave blank if using Azure AD auth (default). Set if `AZURE_OPENAI_USE_AZURE_AD=false` |
+### Step 6 — Stamp ACR into manifests
 
-**Never commit `secret.yaml` — it is gitignored.**
+```bash
+sed -i 's|<ACR_LOGIN_SERVER>|<your-acr>.azurecr.io|g' k8s/deployment.yaml k8s/worker-deployment.yaml
+```
 
----
+### Step 7 — Deploy all manifests
 
-## Step 8 — Set up the ServiceNow Business Rule
+```bash
+# Core
+kubectl apply -f k8s/configmap.yaml -f k8s/secret.yaml \
+              -f k8s/deployment.yaml -f k8s/service.yaml -f k8s/ingress.yaml \
+              -n snow-terraform-agent
 
-In your ServiceNow instance:
+# Worker + KEDA (edit keda-scaledobject.yaml first — replace <ASB_NAMESPACE> with your ASB namespace name)
+kubectl apply -f k8s/worker-deployment.yaml \
+              -f k8s/keda-auth.yaml \
+              -f k8s/keda-scaledobject.yaml \
+              -n snow-terraform-agent
 
-### Create the REST Message
+kubectl get pods -n snow-terraform-agent -w
+```
 
+### Step 8 — Set up ServiceNow Business Rule
+
+Use the APIM gateway URL (not the AKS ingress URL directly):
+
+**Create the REST Message:**
 1. Navigate to **System Web Services → Outbound → REST Messages → New**
 2. Fill in:
    - **Name**: `ProvisioningAgent`
-   - **Endpoint**: `http://<your-hostname>/api/provision`
+   - **Endpoint**: `https://snow-agent-apim.azure-api.net/api/provision`
    - **HTTP Method**: POST
 3. Add header: `Content-Type: application/json`
 4. Set body: `{"ticket_id": "${ticket_id}"}`
 
-### Create the Business Rule
-
+**Create the Business Rule:**
 1. Navigate to **System Definition → Business Rules → New**
 2. Fill in:
    - **Table**: `sc_req_item`
@@ -188,11 +279,69 @@ rm.execute();
 
 ---
 
+## Config reference
+
+### k8s/configmap.yaml — non-sensitive values
+
+| Key | Where to find it |
+|-----|-----------------|
+| `AZURE_OPENAI_ENDPOINT` | Azure Portal → OpenAI resource → Keys and Endpoint |
+| `AZURE_OPENAI_DEPLOYMENT_NAME` | Azure Portal → OpenAI resource → Model deployments |
+| `AZURE_OPENAI_MODEL_NAME` | Same as deployment name |
+| `SERVICENOW_INSTANCE_URL` | e.g. `https://dev123456.service-now.com` |
+| `SERVICENOW_USERNAME` | SNOW admin username |
+| `GITHUB_ORG` | GitHub org or username |
+| `GITHUB_TERRAFORM_REPO` | Terraform modules repo name |
+| `AZURE_SUBSCRIPTION_ID` | `az account show --query id -o tsv` |
+| `AZURE_CLIENT_ID` | Azure Portal → App Registrations → Application (client) ID |
+| `AZURE_TENANT_ID` | Azure Portal → App Registrations → Directory (tenant) ID |
+| `AZURE_SERVICE_BUS_HOSTNAME` | Terraform output: `service_bus_hostname` (production only) |
+| `AZURE_STORAGE_ACCOUNT_NAME` | Terraform output: `storage_account_name` (production only) |
+| `APPLICATIONINSIGHTS_CONNECTION_STRING` | Terraform output: `app_insights_connection_string` (production only) |
+
+### k8s/secret.yaml — sensitive credentials
+
+| Key | Where to find it |
+|-----|-----------------|
+| `AZURE_CLIENT_SECRET` | Azure Portal → App Registrations → Certificates & Secrets |
+| `SERVICENOW_PASSWORD` | SNOW admin password |
+| `GITHUB_PERSONAL_ACCESS_TOKEN` | GitHub → Settings → Developer Settings → PATs (`repo` + `workflow`) |
+| `AZURE_OPENAI_API_KEY` | Leave blank if `AZURE_OPENAI_USE_AZURE_AD=true` (default) |
+
+**Never commit `secret.yaml` — it is gitignored.**
+
+---
+
+## Terraform modules repo
+
+The agent fetches an example Terraform template from your GitHub repo at:
+
+```
+https://github.com/<GITHUB_ORG>/<GITHUB_TERRAFORM_REPO>/contents/examples/storage-account-example/main.tf
+```
+
+This template is injected into the LLM system prompt as the pattern for HCL generation. The better your example modules, the better the generated output.
+
+You can fork the reference repo at [`natesanshreyas/terraform-modules-demo`](https://github.com/natesanshreyas/terraform-modules-demo) which includes modules for `resource-group`, `storage-account`, and `openai`.
+
+---
+
+## Ingress options
+
+`k8s/ingress.yaml` defaults to public nginx + Azure Load Balancer. Read the comments at the top of that file for:
+
+- **Internal nginx** — private VNet only
+- **APIM in front** — delete ingress.yaml, configure APIM to route to ClusterIP Service
+- **Private endpoint** — delete ingress.yaml, use org's internal gateway
+
+---
+
 ## Updating the app
 
 ```bash
 az acr build --registry <your-acr> --image snow-terraform-agent:latest .
 kubectl rollout restart deployment/snow-terraform-agent
+kubectl rollout restart deployment/snow-terraform-agent-worker   # if running async mode
 ```
 
 ---
@@ -215,17 +364,34 @@ cd infra/aks-existing && terraform destroy
 
 ## Architecture
 
-### POC (this repo)
+### POC
 ```
-SNOW → AKS (ingress → pod) → OpenAI + SNOW MCP + GitHub MCP
+SNOW → AKS (ingress → API pod) → OpenAI + SNOW MCP + GitHub MCP
 ```
 
-### Production additions recommended
-| Component | Purpose |
-|-----------|---------|
-| Azure API Management | Rate limiting, auth, private endpoint gateway |
-| Azure Service Bus | Async job queue so SNOW doesn't wait on agent completion |
-| Azure Blob Storage | Job status persistence and result storage |
-| Private Endpoint | Lock AKS to VNet, no public ingress |
-| Workload Identity | Replace service principal client secret with pod-level managed identity |
-| Application Insights | Observability and eval score logging |
+### Production
+```
+SNOW → APIM → AKS ingress → API pod → Service Bus
+                                           ↓
+                              Worker pod (KEDA-scaled, 0–5)
+                                           ↓
+                              OpenAI + SNOW MCP + GitHub MCP + Azure MCP
+                                           ↓
+                              Blob Storage (run state) + App Insights (traces)
+```
+
+### Azure services used
+
+| Service | POC | Production |
+|---------|-----|------------|
+| AKS | ✅ | ✅ |
+| ACR | ✅ | ✅ |
+| Azure Load Balancer | ✅ | ✅ |
+| Azure OpenAI | ✅ | ✅ |
+| Azure Active Directory | ✅ | ✅ |
+| Azure API Management | — | ✅ |
+| Azure Service Bus | — | ✅ |
+| Azure Blob Storage | — | ✅ |
+| Application Insights | — | ✅ |
+| Log Analytics Workspace | — | ✅ |
+| Azure Key Vault | — | ✅ |

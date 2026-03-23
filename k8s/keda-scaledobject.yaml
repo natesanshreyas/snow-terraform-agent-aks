@@ -1,0 +1,33 @@
+# ---------------------------------------------------------------------------
+# KEDA ScaledObject — scales the worker Deployment based on ASB queue depth
+#
+# Behavior:
+#   - 0 messages in queue  → 0 worker pods (scales to zero)
+#   - 1+ messages          → pods scale up (1 pod per message, max 5)
+#   - Queue drains          → pods scale back to 0
+#
+# Prerequisites:
+#   - KEDA installed: helm install keda kedacore/keda --namespace keda --create-namespace
+#   - keda-auth.yaml applied first (provides ASB authentication)
+#
+# Replace <ASB_NAMESPACE> with the value from Terraform output: service_bus_hostname
+# (strip the .servicebus.windows.net suffix — just the namespace name)
+# ---------------------------------------------------------------------------
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: snow-terraform-agent-worker
+spec:
+  scaleTargetRef:
+    name: snow-terraform-agent-worker
+  minReplicaCount: 0
+  maxReplicaCount: 5
+  cooldownPeriod: 60
+  triggers:
+    - type: azure-servicebus
+      metadata:
+        queueName: provisioning-queue
+        namespace: <ASB_NAMESPACE>
+        messageCount: "1"
+      authenticationRef:
+        name: keda-asb-auth

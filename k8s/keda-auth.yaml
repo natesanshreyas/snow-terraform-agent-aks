@@ -1,0 +1,18 @@
+# ---------------------------------------------------------------------------
+# KEDA TriggerAuthentication — tells KEDA how to authenticate to Service Bus
+#
+# Uses Azure Workload Identity (pod-level managed identity).
+# This requires Workload Identity enabled on the AKS cluster and the pod's
+# service account annotated with the managed identity client ID.
+#
+# If you are not using Workload Identity (e.g. POC with service principal),
+# replace the podIdentity block with a secretTargetRef pointing to the
+# AZURE_SERVICE_BUS_CONNECTION_STRING in your secret.yaml.
+# ---------------------------------------------------------------------------
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-asb-auth
+spec:
+  podIdentity:
+    provider: azure-workload
