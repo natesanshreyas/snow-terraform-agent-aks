@@ -1,25 +1,25 @@
-"""Terraform HCL quality evaluator using Azure OpenAI.
+"""Terraform HCL quality evaluator using Azure AI Evaluation SDK.
 
-Three independent LLM judges score the generated code 1–5 on:
+Three SDK-compatible evaluator classes score generated Terraform 1-5 on:
   security   — no hardcoded credentials or sensitive literals
   compliance — required cost_center + ticket_id tags present
   quality    — uses module pattern, not raw resource blocks
 
-All three must score >= 3 to pass.  If a run fails, a human-readable
-reason is returned so the orchestrator can inject feedback and ask the
-LLM to regenerate (up to 2 retries).
+All three must score >= 3 to pass.  If a run fails, feedback is returned so the
+orchestrator can inject it and ask for regeneration (up to 2 retries).
 
-Optionally logs results to Azure AI Foundry Evaluations tab if
-AZURE_AI_FOUNDRY_PROJECT_CONNECTION_STRING is set in the environment.
+Results are logged to Azure AI Foundry Evaluations tab via evaluate() when
+AZURE_AI_FOUNDRY_PROJECT_CONNECTION_STRING is configured.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import os
 import re
+import tempfile
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Dict
 
 from .openai_client import OpenAISettings, chat_completion
 
@@ -109,28 +109,18 @@ Return ONLY a JSON object (no markdown, no explanation outside JSON):
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helper — parse {score, reason} from LLM response
 # ---------------------------------------------------------------------------
 
 
-def _call_evaluator(prompt: str, settings: OpenAISettings) -> dict:
-    """Call LLM and parse the {score, reason} JSON response."""
-    response = chat_completion(
-        settings,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1500,
-    )
-    text = response.strip()
-
-    # Direct parse
+def _parse_score(text: str) -> dict:
+    text = text.strip()
     try:
         obj = json.loads(text)
         if isinstance(obj, dict) and "score" in obj:
             return obj
     except Exception:
         pass
-
-    # Scan for first valid JSON object
     decoder = json.JSONDecoder()
     for m in re.finditer(r"\{", text):
         try:
@@ -139,9 +129,125 @@ def _call_evaluator(prompt: str, settings: OpenAISettings) -> dict:
                 return obj
         except Exception:
             continue
-
     logger.warning("Evaluator returned unparseable response: %s", text[:300])
     return {"score": 3, "reason": "Could not parse evaluator response"}
+
+
+# ---------------------------------------------------------------------------
+# Azure AI Evaluation SDK-compatible evaluator classes
+# Each class has a __call__ that the SDK invokes per data row.
+# ---------------------------------------------------------------------------
+
+
+class SecurityEvaluator:
+    """Scores Terraform HCL 1-5 on security (no hardcoded secrets/credentials)."""
+
+    def __init__(self, openai_settings: OpenAISettings):
+        self._settings = openai_settings
+
+    def __call__(self, *, main_tf: str, variables_tf: str = "", **kwargs) -> dict:
+        prompt = _SECURITY_PROMPT.format(main_tf=main_tf, variables_tf=variables_tf)
+        response = chat_completion(
+            self._settings,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500,
+        )
+        result = _parse_score(response)
+        score = max(1, min(5, int(result.get("score", 3))))
+        return {
+            "security_score": score,
+            "security_reason": result.get("reason", ""),
+            "security_passed": score >= _PASS_THRESHOLD,
+        }
+
+
+class ComplianceEvaluator:
+    """Scores Terraform HCL 1-5 on tag compliance (cost_center + ticket_id required)."""
+
+    def __init__(self, openai_settings: OpenAISettings):
+        self._settings = openai_settings
+
+    def __call__(self, *, main_tf: str, ticket_id: str = "", **kwargs) -> dict:
+        prompt = _COMPLIANCE_PROMPT.format(main_tf=main_tf, ticket_id=ticket_id)
+        response = chat_completion(
+            self._settings,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500,
+        )
+        result = _parse_score(response)
+        score = max(1, min(5, int(result.get("score", 3))))
+        return {
+            "compliance_score": score,
+            "compliance_reason": result.get("reason", ""),
+            "compliance_passed": score >= _PASS_THRESHOLD,
+        }
+
+
+class QualityEvaluator:
+    """Scores Terraform HCL 1-5 on structural quality (module pattern usage)."""
+
+    def __init__(self, openai_settings: OpenAISettings):
+        self._settings = openai_settings
+
+    def __call__(self, *, main_tf: str, variables_tf: str = "", **kwargs) -> dict:
+        prompt = _QUALITY_PROMPT.format(main_tf=main_tf, variables_tf=variables_tf)
+        response = chat_completion(
+            self._settings,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500,
+        )
+        result = _parse_score(response)
+        score = max(1, min(5, int(result.get("score", 3))))
+        return {
+            "quality_score": score,
+            "quality_reason": result.get("reason", ""),
+            "quality_passed": score >= _PASS_THRESHOLD,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Core evaluation runner — calls azure.ai.evaluation.evaluate()
+# ---------------------------------------------------------------------------
+
+
+def _run_evaluate(
+    main_tf: str,
+    variables_tf: str,
+    ticket_id: str,
+    openai_settings: OpenAISettings,
+) -> dict:
+    """Synchronous evaluate() call — invoked via asyncio.to_thread."""
+    from azure.ai.evaluation import evaluate
+    from .telemetry import get_foundry_scope
+
+    # Write a single-row JSONL file for evaluate()
+    row = {"main_tf": main_tf, "variables_tf": variables_tf, "ticket_id": ticket_id}
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        f.write(json.dumps(row) + "\n")
+        data_path = f.name
+
+    kwargs: Dict[str, Any] = {
+        "evaluation_name": f"terraform-eval-{ticket_id}",
+        "data": data_path,
+        "evaluators": {
+            "security":   SecurityEvaluator(openai_settings),
+            "compliance": ComplianceEvaluator(openai_settings),
+            "quality":    QualityEvaluator(openai_settings),
+        },
+        "evaluator_config": {
+            "security":   {"main_tf": "${data.main_tf}", "variables_tf": "${data.variables_tf}"},
+            "compliance": {"main_tf": "${data.main_tf}", "ticket_id": "${data.ticket_id}"},
+            "quality":    {"main_tf": "${data.main_tf}", "variables_tf": "${data.variables_tf}"},
+        },
+    }
+
+    # Log to Foundry Evaluations tab if project is configured
+    scope = get_foundry_scope()
+    if scope:
+        kwargs["azure_ai_project"] = scope
+        logger.info("Foundry project attached — scores will appear in Evaluations tab")
+
+    return evaluate(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -155,89 +261,39 @@ async def evaluate_terraform(
     ticket_id: str,
     openai_settings: OpenAISettings,
 ) -> EvalResult:
-    """Evaluate generated HCL. Runs three judges sequentially to stay within quota."""
-    import asyncio
+    """Run all three SDK evaluators via evaluate() and return a structured result."""
+    logger.info("Running Terraform evaluation for ticket=%s", ticket_id)
 
-    logger.info("Running Terraform evaluation for ticket=%s (sequential judges)", ticket_id)
+    result = await asyncio.to_thread(
+        _run_evaluate, main_tf, variables_tf, ticket_id, openai_settings
+    )
 
-    sec = await asyncio.to_thread(_call_evaluator, _SECURITY_PROMPT.format(main_tf=main_tf, variables_tf=variables_tf), openai_settings)
-    comp = await asyncio.to_thread(_call_evaluator, _COMPLIANCE_PROMPT.format(main_tf=main_tf, ticket_id=ticket_id), openai_settings)
-    qual = await asyncio.to_thread(_call_evaluator, _QUALITY_PROMPT.format(main_tf=main_tf, variables_tf=variables_tf), openai_settings)
+    # evaluate() returns {"rows": [...], "metrics": {...}, ...}
+    row = result["rows"][0]
 
-    s = max(1, min(5, int(sec.get("score", 3))))
-    c = max(1, min(5, int(comp.get("score", 3))))
-    q = max(1, min(5, int(qual.get("score", 3))))
+    s = max(1, min(5, int(row.get("outputs.security.security_score",   3))))
+    c = max(1, min(5, int(row.get("outputs.compliance.compliance_score", 3))))
+    q = max(1, min(5, int(row.get("outputs.quality.quality_score",     3))))
 
     passed = s >= _PASS_THRESHOLD and c >= _PASS_THRESHOLD and q >= _PASS_THRESHOLD
 
     reasons: list[str] = []
     if s < _PASS_THRESHOLD:
-        reasons.append(f"Security ({s}/5): {sec.get('reason', '')}")
+        reasons.append(f"Security ({s}/5): {row.get('outputs.security.security_reason', '')}")
     if c < _PASS_THRESHOLD:
-        reasons.append(f"Compliance ({c}/5): {comp.get('reason', '')}")
+        reasons.append(f"Compliance ({c}/5): {row.get('outputs.compliance.compliance_reason', '')}")
     if q < _PASS_THRESHOLD:
-        reasons.append(f"Quality ({q}/5): {qual.get('reason', '')}")
-
-    result = EvalResult(
-        security=s,
-        compliance=c,
-        quality=q,
-        passed=passed,
-        reason="; ".join(reasons),
-    )
+        reasons.append(f"Quality ({q}/5): {row.get('outputs.quality.quality_reason', '')}")
 
     logger.info(
         "Eval: security=%d compliance=%d quality=%d passed=%s",
         s, c, q, passed,
     )
 
-    _log_to_foundry(result, ticket_id)
-    return result
-
-
-def _log_to_foundry(result: EvalResult, ticket_id: str) -> None:
-    """Log evaluation scores to Foundry Evaluations tab (fire-and-forget).
-
-    Uses the project scope from telemetry.get_foundry_scope().  If the scope
-    is unavailable (local dev without Foundry configured) this is a silent no-op.
-    """
-    from .telemetry import get_foundry_scope
-
-    scope = get_foundry_scope()
-    if scope is None:
-        logger.debug("Foundry scope not available; skipping evaluation log")
-        return
-
-    try:
-        import tempfile
-        import json as _json
-        from azure.ai.evaluation import evaluate
-        from azure.identity import DefaultAzureCredential
-
-        # azure-ai-evaluation expects a JSONL data file
-        row = {
-            "ticket_id": ticket_id,
-            "main_tf": "",   # already evaluated; pass empty for record-keeping
-            "security_score": result.security,
-            "compliance_score": result.compliance,
-            "quality_score": result.quality,
-            "passed": result.passed,
-            "reason": result.reason,
-        }
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".jsonl", delete=False
-        ) as tmp:
-            tmp.write(_json.dumps(row) + "\n")
-            tmp_path = tmp.name
-
-        evaluate(
-            evaluation_name=f"terraform-eval-{ticket_id}",
-            data=tmp_path,
-            evaluators={},          # scores are pre-computed; no additional evaluators needed
-            azure_ai_project=scope,
-            output_path=None,
-        )
-        logger.info("Logged evaluation run to Foundry for ticket=%s", ticket_id)
-    except Exception as exc:
-        # Non-fatal — Foundry logging should never block provisioning
-        logger.debug("Foundry evaluation log failed: %s", exc)
+    return EvalResult(
+        security=s,
+        compliance=c,
+        quality=q,
+        passed=passed,
+        reason="; ".join(reasons),
+    )
